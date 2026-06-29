@@ -22,17 +22,60 @@ SOFTWARE.
 
 ---
 
-Portions of this software (specifically `find_tbh_window`, `click_abs`,
-`SendInput` ctypes bindings, and parts of the multi-monitor click math)
-are derived from:
+THIRD-PARTY ATTRIBUTION (NOTICE)
+================================
 
-  alandsamuel/TBH_Task-Bar-Hero_Bot (https://github.com/alandsamuel/TBH_Task-Bar-Hero_Bot)
-  Licensed under the Apache License, Version 2.0.
+This product includes software developed by:
 
-You may obtain a copy of the License at:
+  alandsamuel
+  Project: TBH_Task-Bar-Hero_Bot
+  Source:  https://github.com/alandsamuel/TBH_Task-Bar-Hero_Bot
+  License: Apache License, Version 2.0
+
+Files vendored verbatim from that project (Apache-2.0, preserved
+without modification under `vendor/`):
+
+  vendor/shared/memory.py
+  vendor/shared/__init__.py
+  vendor/config/offsets.py
+  vendor/config/__init__.py
+  vendor/il2cpp/typeinfo.py
+  vendor/il2cpp/finder.py
+  vendor/il2cpp/__init__.py
+
+Code derived from that project (lifted into `memory_attach.py`, which
+adds a singleton wrapper + public `get_pending(hwnd)` API on top of
+the vendored primitives):
+
+  * The `GameAttach` class (process attach + IL2CPP TypeInfoTable
+    resolution + AggregateManager klass walk) — lifted from
+    alandsamuel's `chest_mvp.py` lines ~117-211.
+  * The `pending_chests()` method (BoxObtain - BoxOpen read) — lifted
+    from alandsamuel's `chest_mvp.py` lines ~205-211.
+  * The `_CALIB` seed constants (`anchor_rva=102128400`, `idx_ut=2827`)
+    matching build v1.00.21.
+
+The full NOTICE block for the vendored code (including the
+import-path layout and the read-only invariant) is at the top of
+`memory_attach.py`. The `GameAttach` and `pending_chests` snippets
+retain alandsamuel's Apache-2.0 license header via the upstream file
+they were copied from.
+
+Code lifted (not vendored) in `chest_state.py` (Apache-2.0):
+
+  * `find_tbh_window()` — window-find by Unity class + exe name.
+  * `click_abs()` and the `SendInput` ctypes bindings + multi-monitor
+    click math.
+
+You may obtain a copy of the Apache License, Version 2.0 at:
 
   http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
-distributed under the Apache-2.0 License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+distributed under the Apache-2.0 License is distributed on an "AS IS"
+BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+or implied.
+
+See the `LICENSE` files inside `vendor/` (where applicable) and the
+NOTICE block at the top of `memory_attach.py` for the canonical
+attribution required by Apache-2.0 §4(d).
