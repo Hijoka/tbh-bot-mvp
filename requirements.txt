@@ -1,0 +1,4 @@
+# tbh-bot-mvp has zero third-party dependencies.
+# ctypes, json, pathlib, argparse, time, random -- all in the Python stdlib.
+# pywin32 is NOT needed. SendInput, ReadProcessMemory, EnumWindows are
+# all accessed through ctypes.windll directly.
