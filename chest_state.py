@@ -187,11 +187,20 @@ def click_abs(ax, ay, jitter=3, hold_ms=70):
     Uses SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN so coords spanning multiple
     monitors map correctly. Pair with MOUSEEVENTF_VIRTUALDESKTOP (set above)
     or SendInput will silently clip to the primary monitor.
+
+    Falls back to SM_CXSCREEN / SM_CYSCREEN (primary monitor metrics) when
+    the virtual screen metrics are 0 -- happens in some single-monitor
+    configurations, inside RDP/VM sessions, and on a few GPU drivers.
     """
     jx = ax + random.randint(-jitter, jitter)
     jy = ay + random.randint(-jitter, jitter)
     vsx = u32.GetSystemMetrics(76)   # SM_CXVIRTUALSCREEN
     vsy = u32.GetSystemMetrics(77)   # SM_CYVIRTUALSCREEN
+    if vsx <= 0 or vsy <= 0:
+        # Fall back to primary-monitor metrics. Virtual-screen returns 0
+        # on some single-monitor configs -- without this, divide-by-zero.
+        vsx = u32.GetSystemMetrics(0) or 1920   # SM_CXSCREEN
+        vsy = u32.GetSystemMetrics(1) or 1080   # SM_CYSCREEN
     abs_x = int(jx * 65535 / vsx)
     abs_y = int(jy * 65535 / vsy)
     _send(_MOVE, abs_x, abs_y)
