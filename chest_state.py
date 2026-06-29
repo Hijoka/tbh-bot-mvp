@@ -337,7 +337,7 @@ def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_jso
       edge detector. The counter resets at run boundary.
     """
     state, changed = read_state(live_json_path, prev_state)
-    cur_drops, cur_run, cur_mtime = state
+    cur_drops, cur_run, cur_mtime = state[0], state[1], state[2]    # state is a 4-tuple: (drops, run, mtime, clicks_emitted)
 
     if not changed:
         return prev_state                                       # no work
