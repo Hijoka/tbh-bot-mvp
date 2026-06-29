@@ -260,7 +260,14 @@ def read_state(live_json_path: str, prev_state):
     mtime is the file's st_mtime at the read (used by tick() for log
     timestamps and to skip logging on no-change ticks).
     """
-    prev_drops, prev_run, prev_mtime = (None, None, 0.0) if prev_state is None else prev_state
+    prev_drops, prev_run, prev_mtime = (None, None, 0.0) if prev_state is None else (prev_state[0], prev_state[1], prev_state[2])
+    # clicks_emitted (4th element) is preserved across reads — it lives
+    # in the state tuple but read_state() doesn't need to look at it.
+    # Defensive: if a 3-tuple state is somehow passed in (old code path,
+    # saved state from an earlier version), default to (0, 0, 0).
+    prev_clicks = (0, 0, 0)
+    if prev_state is not None and len(prev_state) >= 4:
+        prev_clicks = prev_state[3]
     try:
         mtime = os.stat(live_json_path).st_mtime
     except OSError:
@@ -284,7 +291,7 @@ def read_state(live_json_path: str, prev_state):
         run_id = int(run_id) if run_id is not None else None
     except (TypeError, ValueError):
         run_id = None
-    return (drops_t, run_id, mtime), True
+    return (drops_t, run_id, mtime, prev_clicks), True
 
 
 def _log(msg, log_fh):
