@@ -11,6 +11,13 @@ STATE  : drops = [Monster, Boss, ActBoss] — per-run counter from the meter.
 ACTION : on any per-tier rising edge (cur[i] > prev[i]), click the chest
          icon at (wx, wy) window-relative. One click per edge — even if
          5 chests drop in a single run, we click 5 times.
+         Edge case — the TRAILING-BOSS-BOX FLASH: on stage clear, the
+         boss chest drops AND the run ends within ~1 s. The meter briefly
+         raises drops[i] to N then flushes to [0,0,0]. If our poll
+         misses the intermediate write, the rising-edge detector never
+         fires for that chest. We track clicks emitted per tier per run;
+         on run boundary, any tier where prev_drops[i] > clicks_emitted[i]
+         gets clicked for the difference. Counter resets at run end.
 
 History
 -------
@@ -308,6 +315,19 @@ def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_jso
       not once total. If drops goes [1,0,0]→[2,1,1] we click 3 times.
       (The meter's per-tick "absorbed trailing-boss" mechanism can raise
        2 tiers simultaneously.)
+
+    Edge case — the TRAILING-BOSS-BOX FLASH (verified on Admin's PC):
+      On stage clear, the boss's chest drops AND the run ends within
+      ~1 second. The meter briefly raises drops[i] to N, then flushes
+      to [0,0,0]. If our poll cadence (--poll 0.25s) misses the
+      intermediate write — i.e. we read `[0,0,0] → [0,1,0] → [0,0,0]`
+      across two consecutive live.json writes — we never see the rising
+      edge and the Boss chest never gets clicked.
+
+      Fix: track clicks emitted per tier per run. On run boundary, if
+      `prev_drops[i] > _clicks[i]` for any tier, click the difference.
+      This catches chests that flashed too briefly for the normal rising-
+      edge detector. The counter resets at run boundary.
     """
     state, changed = read_state(live_json_path, prev_state)
     cur_drops, cur_run, cur_mtime = state
@@ -323,7 +343,11 @@ def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_jso
         _log(f"[click] cannot get window rect: {e}", log_fh)
         return state
 
-    prev_drops, prev_run, prev_mtime = (None, None, 0.0) if prev_state is None else prev_state
+    if prev_state is None:
+        prev_drops, prev_run, prev_mtime = (None, None, 0.0)
+        clicks_emitted = (0, 0, 0)        # one per tier for the (about-to-start) run
+    else:
+        prev_drops, prev_run, prev_mtime, clicks_emitted = prev_state
 
     # First-ever read or new file -- establish baseline. No click even if
     # drops > 0: by the time we read, the chests may already be openable;
@@ -331,61 +355,84 @@ def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_jso
     # change.
     if prev_drops is None:
         _log(f"[state] baseline drops={list(cur_drops)} run={cur_run} (from {live_json_path})", log_fh)
-        return state
+        return (cur_drops, cur_run, cur_mtime, (0, 0, 0))
 
     # Run-end reset: drops flushed to all zeros, or run id advanced.
-    # Either case = adopt fresh baseline, no clicks (we don't retroactively
-    # click chests that dropped in a previous run).
+    # Either case = adopt fresh baseline, BUT first check if we missed
+    # any rising edges during the run that just ended (the trailing-boss-
+    # box flash). For any tier where prev_drops[i] > clicks_emitted[i],
+    # click the difference. Counter resets for the next run.
     run_changed = cur_run is not None and prev_run is not None and cur_run != prev_run
     zero_after_nonzero = all(c == 0 for c in cur_drops) and any(p > 0 for p in prev_drops)
     if run_changed or zero_after_nonzero:
         reason = "run id changed" if run_changed else "drops flushed to [0,0,0]"
-        _log(f"[state] run boundary ({reason}); prev={list(prev_drops)} run={prev_run}"
-             f" -> cur={list(cur_drops)} run={cur_run}; fresh baseline, no click", log_fh)
-        return state
+        # Catch any missed rising edges from the trailing-boss flash.
+        missed = [prev_drops[i] - clicks_emitted[i] for i in range(3)]
+        missed_total = sum(m for m in missed if m > 0)
+        tier_names = ("Monster", "Boss", "ActBoss")
+        if missed_total > 0:
+            tier_summary = ", ".join("%s+%d" % (tier_names[i], m)
+                                     for i, m in enumerate(missed) if m > 0)
+            _log(f"[state] run boundary ({reason}); prev={list(prev_drops)} run={prev_run}"
+                 f" -> cur={list(cur_drops)} run={cur_run}; "
+                 f"missed {missed_total} rising edge(s) (tiers=[{tier_summary}]) "
+                 f"from trailing-boss flash | click ({ax},{ay}) x{missed_total}", log_fh)
+            _do_clicks(missed_total, ax, ay, click_mode, virtual_desktop, log_fh)
+        else:
+            _log(f"[state] run boundary ({reason}); prev={list(prev_drops)} run={prev_run}"
+                 f" -> cur={list(cur_drops)} run={cur_run}; "
+                 f"clicks emitted={list(clicks_emitted)}; fresh baseline, no click", log_fh)
+        return (cur_drops, cur_run, cur_mtime, (0, 0, 0))
 
     # No change — skip (cur == prev means all tiers unchanged)
     if cur_drops == prev_drops:
-        return state
+        return prev_state
 
     # Per-tier rising edges: any cur[i] > prev[i] is a fresh drop → click.
+    # Also count up clicks emitted per tier so run-end can detect missed
+    # edges from the trailing-boss flash.
     n_clicks = 0
-    tier_names = ("Monster", "Boss", "ActBoss")
     fired = []
+    new_clicks = list(clicks_emitted)
     for i in range(3):
         if cur_drops[i] > prev_drops[i]:
-            n_clicks += cur_drops[i] - prev_drops[i]
-            fired.append("%s+%d" % (tier_names[i], cur_drops[i] - prev_drops[i]))
+            delta = cur_drops[i] - prev_drops[i]
+            n_clicks += delta
+            fired.append("%s+%d" % (tier_names[i], delta))
+            new_clicks[i] += delta
 
     if n_clicks == 0:
         # Some weird decrease we didn't classify as run-end (shouldn't happen
         # in practice). Just adopt the new baseline.
         _log(f"[state] non-monotonic drop: prev={list(prev_drops)} -> cur={list(cur_drops)}; "
              f"adopting as new baseline (no click)", log_fh)
-        return state
+        return (cur_drops, cur_run, cur_mtime, clicks_emitted)
 
     _log(f"[state] +{n_clicks} chest(s) dropped "
          f"(drops {list(prev_drops)} -> {list(cur_drops)}, tiers=[{', '.join(fired)}]) "
          f"| click ({ax},{ay}) x{n_clicks}", log_fh)
+    _do_clicks(n_clicks, ax, ay, click_mode, virtual_desktop, log_fh)
 
+    return (cur_drops, cur_run, cur_mtime, tuple(new_clicks))
+
+
+def _do_clicks(n_clicks, ax, ay, click_mode, virtual_desktop, log_fh):
+    """Fire `n_clicks` left-clicks at (ax, ay), respecting click_mode."""
     if click_mode == "dry-run":
-        pass
-    elif click_mode == "preview":
+        return
+    if click_mode == "preview":
         u32.SetCursorPos(ax, ay)
         _log(f"[preview] cursor moved to ({ax},{ay}) -- verify, then add --click", log_fh)
-    elif click_mode == "click":
-        for k in range(n_clicks):
-            try:
-                click_abs(ax, ay, virtual_desktop=virtual_desktop)
-            except RuntimeError as e:
-                _log(f"[click] failed (click {k+1}/{n_clicks}): {e}", log_fh)
-                # Don't loop forever on a broken SendInput — return current state
-                return state
-            # Tiny gap between consecutive clicks to avoid the OS debouncing them
-            if k + 1 < n_clicks:
-                time.sleep(0.08 + random.random() * 0.05)
-
-    return state
+        return
+    # click_mode == "click"
+    for k in range(n_clicks):
+        try:
+            click_abs(ax, ay, virtual_desktop=virtual_desktop)
+        except RuntimeError as e:
+            _log(f"[click] failed (click {k+1}/{n_clicks}): {e}", log_fh)
+            return                                       # stop on first failure
+        if k + 1 < n_clicks:
+            time.sleep(0.08 + random.random() * 0.05)
 
 
 def main():
