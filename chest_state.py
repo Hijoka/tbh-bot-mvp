@@ -342,6 +342,12 @@ def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_jso
     if not changed:
         return prev_state                                       # no work
 
+    # Tier labels — hoisted to function scope so both the run-boundary
+    # branch and the rising-edge branch can use them. (Defining inside
+    # one branch would make it local to the whole function and unbound
+    # when the other branch executes.)
+    tier_names = ("Monster", "Boss", "ActBoss")
+
     # Compute click coord from current window position
     try:
         L, T, _, _ = window_rect(hwnd)
@@ -376,7 +382,6 @@ def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_jso
         # Catch any missed rising edges from the trailing-boss flash.
         missed = [prev_drops[i] - clicks_emitted[i] for i in range(3)]
         missed_total = sum(m for m in missed if m > 0)
-        tier_names = ("Monster", "Boss", "ActBoss")
         if missed_total > 0:
             tier_summary = ", ".join("%s+%d" % (tier_names[i], m)
                                      for i, m in enumerate(missed) if m > 0)
