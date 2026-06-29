@@ -48,6 +48,13 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
+# ---- click cooldown state ----------------------------------------------- #
+# Per-hwnd last-click timestamp, shared across ticks. Default 2.5s between
+# clicks is enough for TBH chest animations to settle without spamming.
+_LAST_CLICK_AT: dict[int, float] = {}
+_LAST_POLL_S = 1.0   # updated by main() to match --poll
+CLICK_COOLDOWN_S = 2.5   # overridden by --cooldown CLI
+
 # ---- Win32 setup (lifted from alandsamuel's auto_click.py, Apache-2.0) --- #
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
@@ -302,33 +309,41 @@ def tick(meter_dir, hwnd, wx, wy, click_mode, prev_state, log_fh):
             print(err); log_fh.write(err + "\n"); log_fh.flush()
             return (cur, mtime)
 
-        if not was_any_one:
-            # Just transitioned from [0,*,*] to having any 1. Sleep once
-            # to let the drop animation settle, then click.
-            msg = (f"[state] drops became non-zero (drops={list(cur)}) | "
-                   f"wait 1.5s, click ({ax},{ay}); will keep clicking "
-                   f"until drops==[0,0,0]")
+        # Cooldown: track time of our last click in a module-level dict
+        # so subsequent ticks can wait before re-clicking. Default 2.5s
+        # matches typical chest-animation settle time.
+        import time as _t
+        last_click_t = _LAST_CLICK_AT.get(hwnd, 0.0)
+        now = _t.time()
+        cooldown_left = max(0.0, last_click_t + CLICK_COOLDOWN_S - now)
+
+        if cooldown_left > 0:
+            # In cooldown: log how long until we can click again, don't click.
+            msg = (f"[state] drops non-zero (drops={list(cur)}) | "
+                   f"cooldown {cooldown_left:.1f}s, polling in {_LAST_POLL_S}s")
             print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-            time.sleep(1.5)
         else:
-            # Still 1 from last poll -- we keep clicking without delay,
-            # since the chest is already on screen and we're just retrying.
-            msg = (f"[state] drops still non-zero (drops={list(cur)}) | "
-                   f"click again ({ax},{ay})")
+            if not was_any_one:
+                msg = (f"[state] chest appeared (drops={list(cur)}) | "
+                       f"click ({ax},{ay})")
+            else:
+                msg = (f"[state] chest still open (drops={list(cur)}) | "
+                       f"click ({ax},{ay}) (cooldown elapsed)")
             print(msg); log_fh.write(msg + "\n"); log_fh.flush()
 
-        if click_mode == "dry-run":
-            pass
-        elif click_mode == "preview":
-            u32.SetCursorPos(ax, ay)
-            msg2 = f"[preview] cursor moved to ({ax},{ay}) -- visually verify, then add --click"
-            print(msg2); log_fh.write(msg2 + "\n"); log_fh.flush()
-        elif click_mode == "click":
-            try:
-                click_abs(ax, ay)
-            except RuntimeError as e:
-                err = f"[click] failed: {e}"
-                print(err); log_fh.write(err + "\n"); log_fh.flush()
+            if click_mode == "dry-run":
+                pass
+            elif click_mode == "preview":
+                u32.SetCursorPos(ax, ay)
+                msg2 = f"[preview] cursor moved to ({ax},{ay}) -- verify, then add --click"
+                print(msg2); log_fh.write(msg2 + "\n"); log_fh.flush()
+            elif click_mode == "click":
+                try:
+                    click_abs(ax, ay)
+                    _LAST_CLICK_AT[hwnd] = now
+                except RuntimeError as e:
+                    err = f"[click] failed: {e}"
+                    print(err); log_fh.write(err + "\n"); log_fh.flush()
 
     elif was_any_one and not any_tier_one:
         # The transition 1 -> 0 we were waiting for.
@@ -355,6 +370,9 @@ def main():
                     help="Seconds between mtime stat() polls (default 1.0 — "
                          "matches tbh-meter's measured ~1s live.json rewrite cadence; "
                          "JSON only re-parses on actual file rewrite)")
+    ap.add_argument("--cooldown", type=float, default=2.5,
+                    help="Seconds between clicks when drops stays non-zero "
+                         "(default 2.5; chest animation settle time)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Log decisions but do not click")
     ap.add_argument("--preview", action="store_true",
@@ -394,10 +412,16 @@ def main():
         ap.error("--dry-run, --preview, and --click are mutually exclusive")
     click_mode = "click" if args.click else ("preview" if args.preview else "dry-run")
 
+    # Wire user --cooldown / --poll into the module-level cooldown dict
+    # so the tick() branch can read them.
+    global CLICK_COOLDOWN_S, _LAST_POLL_S
+    CLICK_COOLDOWN_S = args.cooldown
+    _LAST_POLL_S = args.poll
+
     boot = (f"[boot] TBH hwnd={hwnd} rect=({L0},{T0},...) "
             f"click_rel=({args.wx},{args.wy}) abs=({ax0},{ay0}) "
-            f"meter_dir={meter_dir} poll={args.poll}s mode={click_mode} "
-            f"monitors={len(monitor_bounds())}")
+            f"meter_dir={meter_dir} poll={args.poll}s cooldown={args.cooldown}s "
+            f"mode={click_mode} monitors={len(monitor_bounds())}")
     print(boot); log_fh.write(boot + "\n"); log_fh.flush()
 
     prev_state = (None, 0.0)
