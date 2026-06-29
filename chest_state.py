@@ -51,9 +51,16 @@ from pathlib import Path
 # ---- click cooldown state ----------------------------------------------- #
 # Per-hwnd last-click timestamp, shared across ticks. Default 2.5s between
 # clicks is enough for TBH chest animations to settle without spamming.
+#
+# CLICK_OPEN_BLIND_S is the window during which we IGNORE the meter's
+# drops[] state entirely after a click. The meter is unreliable about the
+# 1->0 transition (it can hold 1 for several seconds while the chest is
+# already opening). Inside the blind window we trust our click and stop
+# re-clicking. Default 5s; tune upward if chests aren't all opening.
 _LAST_CLICK_AT: dict[int, float] = {}
-_LAST_POLL_S = 1.0   # updated by main() to match --poll
-CLICK_COOLDOWN_S = 2.5   # overridden by --cooldown CLI
+_LAST_POLL_S = 1.0
+CLICK_COOLDOWN_S = 2.5
+CLICK_OPEN_BLIND_S = 5.0
 
 # ---- Win32 setup (lifted from alandsamuel's auto_click.py, Apache-2.0) --- #
 u32 = ctypes.windll.user32
@@ -162,14 +169,14 @@ def validate_click_coord(hwnd, wx, wy):
 
 # ---- SendInput (lifted from alandsamuel's click.py, Apache-2.0) ----------- #
 # 0x8000 = MOUSEEVENTF_ABSOLUTE
-# 0x4000 = MOUSEEVENTF_VIRTUALDESKTOP (REQUIRED for multi-monitor -- without it,
-#                                     SendInput clips to the primary monitor
-#                                     and ignores monitor-2/3 coords)
+# 0x4000 = MOUSEEVENTF_VIRTUALDESKTOP. Required for multi-monitor (without
+#          it, SendInput clips to the primary monitor and ignores monitor 2+).
+#          On single-monitor systems (monitors==1) it's harmless but unnecessary;
+#          we drop it via ClickConfig to keep math simpler there.
 INPUT_MOUSE = 0
-_ABS_VIRT = 0x8000 | 0x4000
-_MOVE = 0x0001 | _ABS_VIRT
-_DOWN = 0x0002 | _ABS_VIRT
-_UP = 0x0004 | _ABS_VIRT
+_MOVE_ABS = 0x0001 | 0x8000
+_DOWN_ABS = 0x0002 | 0x8000
+_UP_ABS = 0x0004 | 0x8000
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -188,33 +195,38 @@ def _send(flags, x, y):
         raise RuntimeError("SendInput failed")
 
 
-def click_abs(ax, ay, jitter=3, hold_ms=70):
-    """Left-click at absolute VIRTUAL-SCREEN pixel (ax, ay). Light humanization.
+def click_abs(ax, ay, jitter=3, hold_ms=70, virtual_desktop=True):
+    """Left-click at absolute pixel (ax, ay). Light humanization.
 
-    Uses SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN so coords spanning multiple
-    monitors map correctly. Pair with MOUSEEVENTF_VIRTUALDESKTOP (set above)
-    or SendInput will silently clip to the primary monitor.
-
-    Falls back to SM_CXSCREEN / SM_CYSCREEN (primary monitor metrics) when
-    the virtual screen metrics are 0 -- happens in some single-monitor
-    configurations, inside RDP/VM sessions, and on a few GPU drivers.
+    Multi-monitor: pass virtual_desktop=True with SM_CXVIRTUALSCREEN divisor.
+    Single-monitor: pass virtual_desktop=False with SM_CXSCREEN divisor --
+                    simpler mapping, and avoids the rare case where
+                    SM_CXVIRTUALSCREEN returns 0 on some single-monitor
+                    configs (which the previous fallback masked but didn't
+                    fully resolve).
     """
     jx = ax + random.randint(-jitter, jitter)
     jy = ay + random.randint(-jitter, jitter)
-    vsx = u32.GetSystemMetrics(76)   # SM_CXVIRTUALSCREEN
-    vsy = u32.GetSystemMetrics(77)   # SM_CYVIRTUALSCREEN
-    if vsx <= 0 or vsy <= 0:
-        # Fall back to primary-monitor metrics. Virtual-screen returns 0
-        # on some single-monitor configs -- without this, divide-by-zero.
+    if virtual_desktop:
+        vsx = u32.GetSystemMetrics(76)   # SM_CXVIRTUALSCREEN
+        vsy = u32.GetSystemMetrics(77)   # SM_CYVIRTUALSCREEN
+        if vsx <= 0 or vsy <= 0:
+            # Fallback path for VM/RDP/some-GPU-drivers: virtual-screen
+            # returns 0 even on single-monitor systems.
+            vsx = u32.GetSystemMetrics(0) or 1920
+            vsy = u32.GetSystemMetrics(1) or 1080
+        flags_move, flags_down, flags_up = _MOVE_ABS | 0x4000, _DOWN_ABS | 0x4000, _UP_ABS | 0x4000
+    else:
         vsx = u32.GetSystemMetrics(0) or 1920   # SM_CXSCREEN
         vsy = u32.GetSystemMetrics(1) or 1080   # SM_CYSCREEN
+        flags_move, flags_down, flags_up = _MOVE_ABS, _DOWN_ABS, _UP_ABS
     abs_x = int(jx * 65535 / vsx)
     abs_y = int(jy * 65535 / vsy)
-    _send(_MOVE, abs_x, abs_y)
+    _send(flags_move, abs_x, abs_y)
     time.sleep(0.04 + random.random() * 0.06)
-    _send(_DOWN, abs_x, abs_y)
+    _send(flags_down, abs_x, abs_y)
     time.sleep(hold_ms / 1000.0)
-    _send(_UP, abs_x, abs_y)
+    _send(flags_up, abs_x, abs_y)
 
 
 # ---- live.json tail + state-driven edge detection ------------------------ #
@@ -240,13 +252,17 @@ def read_live_drops(meter_dir: Path, log_fh=None):
     return None, mtime
 
 
-def tick(meter_dir, hwnd, wx, wy, click_mode, prev_state, log_fh):
+def tick(meter_dir, hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop=True):
     """One poll. Returns (new_drops_or_None, new_mtime).
 
     click_mode is one of:
       'dry-run'  -- log only, no cursor move, no click
       'preview'  -- SetCursorPos to target (real cursor moves, but no click)
       'click'    -- SendInput left-click at target
+
+    virtual_desktop: True for multi-monitor setups (uses VIRTUALDESKTOP flag +
+                     SM_CXVIRTUALSCREEN), False for single-monitor (uses
+                     SM_CXSCREEN + plain ABSOLUTE).
 
     State machine (binary per tier):
       0  = no chest of this tier sitting on the ground
@@ -309,23 +325,33 @@ def tick(meter_dir, hwnd, wx, wy, click_mode, prev_state, log_fh):
             print(err); log_fh.write(err + "\n"); log_fh.flush()
             return (cur, mtime)
 
-        # Cooldown: track time of our last click in a module-level dict
-        # so subsequent ticks can wait before re-clicking. Default 2.5s
-        # matches typical chest-animation settle time.
+        # Click cooldown prevents firing multiple SendInput calls inside
+        # the chest-animation window. CLICK_OPEN_BLIND_S extends the cooldown
+        # specifically across the period where the meter is unreliable about
+        # the drops[] 1->0 transition -- the chest might be opening but the
+        # meter still reports 1. We ignore that signal entirely.
         import time as _t
         last_click_t = _LAST_CLICK_AT.get(hwnd, 0.0)
         now = _t.time()
+        elapsed_since_click = now - last_click_t
+        blind_window_left = max(0.0, last_click_t + CLICK_OPEN_BLIND_S - now)
         cooldown_left = max(0.0, last_click_t + CLICK_COOLDOWN_S - now)
 
-        if cooldown_left > 0:
-            # In cooldown: log how long until we can click again, don't click.
+        if blind_window_left > 0:
+            # Inside the "ignore meter's drops[1] hold" window. Don't click,
+            # don't second-guess. Just wait it out.
+            msg = (f"[state] drops non-zero (drops={list(cur)}) | "
+                   f"in open-blind window {blind_window_left:.1f}s, ignoring")
+            print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+        elif cooldown_left > 0:
             msg = (f"[state] drops non-zero (drops={list(cur)}) | "
                    f"cooldown {cooldown_left:.1f}s, polling in {_LAST_POLL_S}s")
             print(msg); log_fh.write(msg + "\n"); log_fh.flush()
         else:
             if not was_any_one:
                 msg = (f"[state] chest appeared (drops={list(cur)}) | "
-                       f"click ({ax},{ay})")
+                       f"click ({ax},{ay}) (open-blind {CLICK_OPEN_BLIND_S}s "
+                       f"begins now)")
             else:
                 msg = (f"[state] chest still open (drops={list(cur)}) | "
                        f"click ({ax},{ay}) (cooldown elapsed)")
@@ -339,7 +365,7 @@ def tick(meter_dir, hwnd, wx, wy, click_mode, prev_state, log_fh):
                 print(msg2); log_fh.write(msg2 + "\n"); log_fh.flush()
             elif click_mode == "click":
                 try:
-                    click_abs(ax, ay)
+                    click_abs(ax, ay, virtual_desktop=virtual_desktop)
                     _LAST_CLICK_AT[hwnd] = now
                 except RuntimeError as e:
                     err = f"[click] failed: {e}"
@@ -373,6 +399,11 @@ def main():
     ap.add_argument("--cooldown", type=float, default=2.5,
                     help="Seconds between clicks when drops stays non-zero "
                          "(default 2.5; chest animation settle time)")
+    ap.add_argument("--blind", type=float, default=5.0,
+                    help="Seconds after a click during which the meter's "
+                         "drops[] state is ignored entirely (default 5.0; "
+                         "covers the window where the meter holds drops=1 "
+                         "even though the chest is already opening)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Log decisions but do not click")
     ap.add_argument("--preview", action="store_true",
@@ -414,14 +445,22 @@ def main():
 
     # Wire user --cooldown / --poll into the module-level cooldown dict
     # so the tick() branch can read them.
-    global CLICK_COOLDOWN_S, _LAST_POLL_S
+    global CLICK_COOLDOWN_S, _LAST_POLL_S, CLICK_OPEN_BLIND_S
     CLICK_COOLDOWN_S = args.cooldown
+    CLICK_OPEN_BLIND_S = args.blind
     _LAST_POLL_S = args.poll
+
+    # Detect monitor count for the click-math switch. monitors==1 means
+    # primary-monitor-only -- skip MOUSEEVENTF_VIRTUALDESKTOP and use
+    # SM_CXSCREEN. >1 requires virtual-desktop handling.
+    monitor_count = len(monitor_bounds())
+    _VIRTUAL_DESKTOP = (monitor_count > 1)
 
     boot = (f"[boot] TBH hwnd={hwnd} rect=({L0},{T0},...) "
             f"click_rel=({args.wx},{args.wy}) abs=({ax0},{ay0}) "
             f"meter_dir={meter_dir} poll={args.poll}s cooldown={args.cooldown}s "
-            f"mode={click_mode} monitors={len(monitor_bounds())}")
+            f"blind={args.blind}s mode={click_mode} monitors={monitor_count} "
+            f"virtual_desktop={_VIRTUAL_DESKTOP}")
     print(boot); log_fh.write(boot + "\n"); log_fh.flush()
 
     prev_state = (None, 0.0)
