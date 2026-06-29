@@ -19,7 +19,8 @@ import sys, traceback
 sys.path.insert(0, '.')
 from memory_attach import _current_pid, GameAttach, _CALIB
 from vendor.shared.memory import open_process, module_base, close, Reader
-from vendor.il2cpp.typeinfo import ga_module, table_base, class_by_index, class_name, bbwf_from_klass
+from vendor.il2cpp.typeinfo import ga_module, table_base, class_by_index, class_name
+from vendor.il2cpp.finder import bbwf_from_klass
 from vendor.config.offsets import EAggregateType, AggregateManager
 
 pid = _current_pid()
