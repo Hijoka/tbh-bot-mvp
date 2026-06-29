@@ -231,156 +231,123 @@ def click_abs(ax, ay, jitter=3, hold_ms=70, virtual_desktop=True):
 
 # ---- live.json tail + state-driven edge detection ------------------------ #
 def read_live_drops(meter_dir: Path, log_fh=None):
-    """Read meter/live.json, return (drops_tuple, mtime) or (None, mtime).
+    """Read meter/live.json, return (drops_tuple, mtime, run) or (None, mtime, None).
 
-    Returning mtime even on read-failure lets the caller cheap-poll every
-    --poll seconds but only re-parse JSON when the meter actually wrote.
-    Drops 6s-of-blink lag to whatever the cadence of file stat() is.
+    drops_tuple is a 3-tuple of int counts -- the meter's "chests dropped this run,
+    per tier" field. mtime is the file's last-modified timestamp; we use it to skip
+    re-parsing JSON when nothing changed. run is the current run id, used to detect
+    run boundaries.
     """
     path = meter_dir / "live.json"
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return None, 0.0
+        return None, 0.0, None
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
         drops = d.get("drops")
+        run = d.get("run")
         if isinstance(drops, list) and len(drops) == 3:
-            return tuple(int(x) for x in drops), mtime
+            return (tuple(int(x) for x in drops), mtime, run)
     except (json.JSONDecodeError, OSError):
         pass
-    return None, mtime
+    return None, mtime, None
 
 
 def tick(meter_dir, hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop=True):
-    """One poll. Returns (new_drops_or_None, new_mtime).
+    """One poll. Returns (new_drops, new_mtime).
 
-    click_mode is one of:
-      'dry-run'  -- log only, no cursor move, no click
-      'preview'  -- SetCursorPos to target (real cursor moves, but no click)
-      'click'    -- SendInput left-click at target
+    State machine: drops[] is a *count* of chests dropped this run, per tier.
+      drops = [a, b, c] = [monster_count, boss_count, actboss_count]
+    Counter rises monotonically within a run, flushes back to [0,0,0] on
+    run end (visible as `run` field change in live.json or a [N,N,N]->[0,0,0]
+    transition in drops[]).
 
-    virtual_desktop: True for multi-monitor setups (uses VIRTUALDESKTOP flag +
-                     SM_CXVIRTUALSCREEN), False for single-monitor (uses
-                     SM_CXSCREEN + plain ABSOLUTE).
+    Action: any per-tier rising edge within the current run -> click once.
 
-    State machine (binary per tier):
-      0  = no chest of this tier sitting on the ground
-      1  = chest of this tier is sitting, not yet opened
+    Out-of-run reset rule:
+      If drops[] just hit [0,0,0] (run ended), or the run field advanced,
+      adopt [0,0,0] as new baseline, no click.
 
-    Action: any 0 -> 1 transition -> click (533, 744) after a 1.5s settle.
-            Any 1 -> 0 transition (chest opened / run reset): no click, log only.
-
-    Why a tuple state instead of "rising-edge counter": the meter holds
-    drops[N] = 1 the whole time the chest is visible, flips to 0 when
-    opened. A counter rising-edge would miss chests that reset to baseline
-    on stage clear before the bot polls.
+    No cooldown, no blind window. The count semantics make those unnecessary:
+    each chest dropped this run produces exactly one click. If we missed a
+    click on a dropped chest, re-clicking on the next rising edge is fine.
     """
-    cur, mtime = read_live_drops(meter_dir, log_fh)
+    cur, mtime, cur_run = read_live_drops(meter_dir, log_fh)
 
-    # No mtime yet -> file unreadable, do nothing.
     if mtime == 0.0:
         return prev_state
 
-    prev_drops, prev_mtime = prev_state
+    prev_drops, prev_mtime, prev_run = prev_state
 
-    # First-ever read or mtime advanced: re-parse JSON.
-    if prev_drops is None or mtime != prev_mtime:
-        # File rewritten by meter; emit fresh snapshot.
-        pass
-    else:
-        # Identical mtime -- nothing changed since last poll.
+    # No new JSON write since last poll: skip work.
+    if prev_drops is not None and mtime == prev_mtime:
         return prev_state
 
     if cur is None:
-        return (prev_drops, mtime)
+        return (prev_drops, mtime, prev_run)
 
-    # Run boundary: every tier flipped N -> 0 simultaneously.
-    if prev_drops is not None and any(prev_drops[i] > cur[i] for i in range(3)):
-        msg = (f"[state] drops {list(prev_drops)} -> {list(cur)} "
-               f"(run boundary or chest auto-collected, no click)")
+    # Run boundary detection: drops flushed to [0,0,0], or run field changed.
+    # In either case the previous run's tally is gone; treat cur as fresh
+    # baseline and do NOT click.
+    run_changed = (cur_run is not None and prev_run is not None
+                   and cur_run != prev_run)
+    if run_changed:
+        msg = (f"[state] new run detected (run={prev_run} -> {cur_run}), "
+               f"resetting baseline from {list(prev_drops) if prev_drops else '?'} "
+               f"to {list(cur)}")
         print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-        return (cur, mtime)
-
-    # Click on any per-tier 0 -> 1 transition AND keep clicking every poll
-    # until the drops tuple returns to [0,0,0]. The user's rule:
-    #   "as long as the binary is 1 we have to click until status changes
-    #    back to [0,0,0]"
-    # Each click hits the chest that the meter is still reporting as 1,
-    # which means there is always a chest on screen to click -- no wasted
-    # clicks, just idempotent retries until the chest auto-collects.
-    tier_names = ["monster", "boss", "actboss"]
-    any_tier_one = any(c == 1 for c in cur)
-    was_any_one = (prev_drops is not None
-                   and any(prev_drops[j] == 1 for j in range(3)))
-
-    if any_tier_one:
-        # First we try to compute coords. If window moved off monitors we
-        # log and don't click this iteration; will retry on next mtime change.
-        try:
-            L, T, _, _ = window_rect(hwnd)
-            ax, ay = L + wx, T + wy
-        except RuntimeError as e:
-            err = f"[click] cannot get window rect: {e}"
-            print(err); log_fh.write(err + "\n"); log_fh.flush()
-            return (cur, mtime)
-
-        # Click cooldown prevents firing multiple SendInput calls inside
-        # the chest-animation window. CLICK_OPEN_BLIND_S extends the cooldown
-        # specifically across the period where the meter is unreliable about
-        # the drops[] 1->0 transition -- the chest might be opening but the
-        # meter still reports 1. We ignore that signal entirely.
-        import time as _t
-        last_click_t = _LAST_CLICK_AT.get(hwnd, 0.0)
-        now = _t.time()
-        elapsed_since_click = now - last_click_t
-        blind_window_left = max(0.0, last_click_t + CLICK_OPEN_BLIND_S - now)
-        cooldown_left = max(0.0, last_click_t + CLICK_COOLDOWN_S - now)
-
-        if blind_window_left > 0:
-            # Inside the "ignore meter's drops[1] hold" window. Don't click,
-            # don't second-guess. Just wait it out.
-            msg = (f"[state] drops non-zero (drops={list(cur)}) | "
-                   f"in open-blind window {blind_window_left:.1f}s, ignoring")
-            print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-        elif cooldown_left > 0:
-            msg = (f"[state] drops non-zero (drops={list(cur)}) | "
-                   f"cooldown {cooldown_left:.1f}s, polling in {_LAST_POLL_S}s")
-            print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-        else:
-            if not was_any_one:
-                msg = (f"[state] chest appeared (drops={list(cur)}) | "
-                       f"click ({ax},{ay}) (open-blind {CLICK_OPEN_BLIND_S}s "
-                       f"begins now)")
-            else:
-                msg = (f"[state] chest still open (drops={list(cur)}) | "
-                       f"click ({ax},{ay}) (cooldown elapsed)")
-            print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-
-            if click_mode == "dry-run":
-                pass
-            elif click_mode == "preview":
-                u32.SetCursorPos(ax, ay)
-                msg2 = f"[preview] cursor moved to ({ax},{ay}) -- verify, then add --click"
-                print(msg2); log_fh.write(msg2 + "\n"); log_fh.flush()
-            elif click_mode == "click":
-                try:
-                    click_abs(ax, ay, virtual_desktop=virtual_desktop)
-                    _LAST_CLICK_AT[hwnd] = now
-                except RuntimeError as e:
-                    err = f"[click] failed: {e}"
-                    print(err); log_fh.write(err + "\n"); log_fh.flush()
-
-    elif was_any_one and not any_tier_one:
-        # The transition 1 -> 0 we were waiting for.
-        msg = f"[state] drops cleared ({list(prev_drops)} -> {list(cur)}) -- chest opened/auto-collected"
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+        return (cur, mtime, cur_run)
 
     if prev_drops is None:
-        msg = f"[state] baseline drops={list(cur)} (binary per tier: 0=empty, 1=chest waiting; click until [0,0,0])"
+        msg = (f"[state] baseline drops={list(cur)} (run={cur_run}, count of chests this run)"
+               if cur_run is not None
+               else f"[state] baseline drops={list(cur)} (count of chests this run)")
         print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+        return (cur, mtime, cur_run)
 
-    return (cur, mtime)
+    if list(cur) == [0, 0, 0] and any(p > 0 for p in prev_drops):
+        msg = (f"[state] drops flushed to [0,0,0] (was {list(prev_drops)}) -- "
+               f"run-end reset, no click")
+        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+        return (cur, mtime, cur_run)
+
+    # Detect rising edges: any tier with cur[i] > prev[i] = a new chest dropped.
+    any_rise = any(cur[i] > prev_drops[i] for i in range(3))
+    if not any_rise:
+        # Pure noiseless update (mtime tick but no event) -- log minimal info.
+        return (cur, mtime, cur_run)
+
+    # Compute click coord from current window position.
+    try:
+        L, T, _, _ = window_rect(hwnd)
+        ax, ay = L + wx, T + wy
+    except RuntimeError as e:
+        err = f"[click] cannot get window rect: {e}"
+        print(err); log_fh.write(err + "\n"); log_fh.flush()
+        return (cur, mtime, cur_run)
+
+    tier_names = ["monster", "boss", "actboss"]
+    per_tier_delta = [cur[i] - prev_drops[i] for i in range(3)]
+    log_deltas = ", ".join(f"{tier_names[i]}+{per_tier_delta[i]}"
+                            for i in range(3) if per_tier_delta[i] > 0)
+    msg = f"[state] chest(s) dropped: {log_deltas} (drops {list(prev_drops)} -> {list(cur)}) | click ({ax},{ay})"
+    print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+
+    if click_mode == "dry-run":
+        pass
+    elif click_mode == "preview":
+        u32.SetCursorPos(ax, ay)
+        msg2 = f"[preview] cursor moved to ({ax},{ay}) -- verify, then add --click"
+        print(msg2); log_fh.write(msg2 + "\n"); log_fh.flush()
+    elif click_mode == "click":
+        try:
+            click_abs(ax, ay, virtual_desktop=virtual_desktop)
+        except RuntimeError as e:
+            err = f"[click] failed: {e}"
+            print(err); log_fh.write(err + "\n"); log_fh.flush()
+
+    return (cur, mtime, cur_run)
 
 
 def main():
@@ -463,7 +430,7 @@ def main():
             f"virtual_desktop={_VIRTUAL_DESKTOP}")
     print(boot); log_fh.write(boot + "\n"); log_fh.flush()
 
-    prev_state = (None, 0.0)
+    prev_state = (None, 0.0, None)
     try:
         while True:
             prev_state = tick(meter_dir, hwnd,
