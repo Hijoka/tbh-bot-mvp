@@ -1,21 +1,39 @@
 r"""chest_state.py — open chest drops gated by TBH meter's live.json state.
 
-State-driven MVP. ~80 lines, stdlib + ctypes only.
+State-driven MVP. ~390 lines, stdlib + ctypes only.
 
-INPUT  : C:\Users\thomas\tbh-meter\live.json (every ~6s the meter rewrites it)
-STATE  : prev_drops[0] vs cur_drops[0] (tier-0 = monster)
-ACTION : rising edge of drops[0] -> left-click (533, 744) window-relative,
-         after a 1.5s delay for the drop animation to settle.
+INPUT  : <meter-dir>/live.json (rewritten every ~1s by tbh-meter)
+STATE  : drops[3] = [monster, boss, actboss], each binary 0/1
+         0 = no chest of this tier sitting
+         1 = chest of this tier is unopened
+ACTION : while ANY drops[N] is 1, click (533, 744) window-relative every
+         1s; stop when drops returns to [0,0,0]. First click per drop
+         waits 1.5s for the chest animation to settle; subsequent clicks
+         are immediate (chest is already on screen, just retrying).
 
-"Many clicks for no reason" -- the dumb autoclicker fires every N seconds
-regardless. This bot fires ONLY when state says a chest dropped.
+User rule: "as long as the binary is 1 we have to click until status
+changes back to [0,0,0]" — no wasted clicks between drops, just enough
+clicks while a chest is on screen to handle animation latency.
+
+Multi-monitor: includes MOUSEEVENTF_VIRTUALDESKTOP so clicks on monitor
+2/3 land correctly (without it, SendInput clips to primary).
+Refresh: stat() mtime check every --poll seconds (default 1.0s matching
+the meter's measured 1s cadence). JSON only re-parses on actual rewrite.
+
+"Many clicks for no reason" — the dumb autoclicker fires every N
+seconds regardless of state. This bot fires only while a chest is
+visible per the meter.
 
 USAGE (PowerShell on Windows):
-    cd C:\Users\thomas\tbh-bot-mvp
-    py -m chest_state                 # default: monster tier, click (533, 744)
-    py -m chest_state --dry-run       # log decisions, never click
-    py -m chest_state --tier 1        # watch boss-tier drops[1] instead
-    py -m chest_state --meter-dir C:\Users\thomas\tbh-meter
+    cd C:\Users\thomas\tbh-bot-mvp   (or wherever you cloned it)
+    py chest_state.py                                # default dry-run
+    py chest_state.py --dry-run                      # log only, no clicks
+    py chest_state.py --preview                      # SetCursorPos only
+    py chest_state.py --click                        # real clicks
+
+    # Defaults assume the meter is at C:\Users\thomas\tbh-meter.
+    # On a different PC, override:
+    py chest_state.py --dry-run --meter-dir C:\Users\Admin\tbh-meter
 
 Stop with Ctrl-C.
 """
