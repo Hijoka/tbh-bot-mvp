@@ -1,36 +1,53 @@
-r"""chest_state.py — open chest drops gated by reading BoxObtain - BoxOpen from game memory.
+r"""chest_state.py — open chest drops gated by reading the meter's live.json.
 
 State-driven MVP. ~300 lines, stdlib + ctypes only.
 
-INPUT  : TaskBarHero.exe process memory (via vendored alandsamuel reader)
-STATE  : pending = BoxObtain - BoxOpen (integer >= 0)
-         0 = no chest sitting
-         N = N chests waiting to be opened
-ACTION : when pending RISES (drop event), click the chest icon at
-         (wx, wy) window-relative. When pending FALLS (chest opened,
-         click confirmed), log only. When pending is unchanged, skip.
+INPUT  : <meter-dir>/live.json (written ~1x/s by mad-labs-org/tbh-meter).
+         We stat() the file each poll and re-parse only when mtime advances
+         (zero-dep mtime fast-poll; no fsnotify / watchdog).
+STATE  : drops = [Monster, Boss, ActBoss] — per-run counter from the meter.
+         rises monotonically within a run as chests drop;
+         resets to [0, 0, 0] on run end (meter "flushes the pending close").
+ACTION : on any per-tier rising edge (cur[i] > prev[i]), click the chest
+         icon at (wx, wy) window-relative. One click per edge — even if
+         5 chests drop in a single run, we click 5 times.
 
-Replaces the previous meter/live.json reader. live.json's `drops[3]` was
-a per-run count, not the binary "chest on screen right now" we needed
-— rising edges fired but the 1->0 transition was unreliable. The memory
-read gets the source of truth from the game itself: BoxObtain and
-BoxOpen are session-total counters; their difference is "chests waiting
-to be opened", which is exactly what we need to gate the click on.
+History
+-------
+v1 (memory read of BoxObtain - BoxOpen):
+  Failed on this build. Verified via _diag2/_diag3 that EAggregateType=3
+  (BoxObtain) is NOT in the AggregateManager outer dict on TBH v1.00.21
+  as installed on Admin's PC. BoxOpen (key=16) IS present and reads as
+  617, but with no BoxObtain there's no "pending = obtained - opened"
+  signal. The meter's own taskhero-engine MemoryReader docstring confirms
+  this is the same gap: "BoxObtain (EAggregateType=3) is NOT in
+  AggregateManager outer dict." The meter's own bot uses
+  PlayerSaveData.BoxData.BoxUniqueId.count() as the alternate path; we
+  do not have that calibration.
 
-Read-side code (process attach + IL2CPP resolution + Dict walks) is
-vendored from alandsamuel/TBH_Task-Bar-Hero_Bot (Apache-2.0). See
-memory_attach.py and the NOTICE block at the top of that file.
+v2 (THIS FILE — meter live.json drops[]):
+  Field semantics verified against the meter's source
+  (mad-labs-org/tbh-meter/reader/meter_windows.py):
+    - build_live_record() at line 406 emits drops=<list-of-3-ints>
+    - _drop_counts() at line 616: dc[EMonsterLogType] += 1 per drop in
+      the CURRENT run + any "absorbed" trailing-boss chests from the
+      pending-close phase. Index = EMonsterLogType (Monster=0, Boss=1,
+      ActBoss=2).
+    - drops[i] NEVER decrements on click — it only resets to 0 at run
+      end (the docstring: "a drop only lowers their baseline, no event;
+      post-flush the count drops back, harmless").
+    - live.json cadence: ~1 Hz (measured median 1.013 s on Admin's PC).
 
 USAGE (PowerShell on Windows):
-    cd C:\Users\thomas\tbh-bot-mvp   (or wherever you cloned it)
-    py chest_state.py                                # default dry-run
-    py chest_state.py --dry-run                      # log only, no clicks
-    py chest_state.py --preview                      # SetCursorPos only
-    py chest_state.py --click                        # real clicks
+    cd C:\Users\Admin\tbh-bot-mvp   (or wherever you cloned it)
+    py chest_state.py                                        # default dry-run
+    py chest_state.py --dry-run                              # log only, no clicks
+    py chest_state.py --preview                              # SetCursorPos only
+    py chest_state.py --click                                # real clicks
 
-    # Default poll cadence is 0.5s; first call takes a few seconds while
-    # the reader attaches to the process.
-    py chest_state.py --click --poll 0.5
+    # Default meter dir is ~/tbh-meter (C:\\Users\\Admin\\tbh-meter).
+    py chest_state.py --click --live-json C:\Users\Admin\tbh-meter\live.json
+    py chest_state.py --click --poll 0.25                    # faster reaction
 
 Stop with Ctrl-C.
 """
@@ -38,22 +55,13 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import random
 import sys
 import time
 from ctypes import wintypes
 from pathlib import Path
-
-# ---- VENDORED meter reader (subset) --------------------------------------- #
-# We import the meter primitives we need through the thin wrapper in
-# memory_attach.py. Vendored from alandsamuel/TBH_Task-Bar-Hero_Bot
-# (Apache-2.0). The `sys.path.insert(0, ".../vendor")` trick must come
-# BEFORE importing memory_attach (which itself inserts vendor/ onto
-# sys.path during its own import). Vendored files use bare imports like
-# `from config.offsets import ...`, which depend on this sys.path layout.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
-import memory_attach  # noqa: E402
 
 
 # ---- Win32 setup (lifted from alandsamuel's auto_click.py, Apache-2.0) --- #
@@ -223,116 +231,177 @@ def click_abs(ax, ay, jitter=3, hold_ms=70, virtual_desktop=True):
     _send(flags_up, abs_x, abs_y)
 
 
-# ---- memory read + state-driven edge detection --------------------------- #
-def read_pending(hwnd):
-    """Read BoxObtain - BoxOpen from game memory. Returns (pending, mtime) or (None, 0.0).
+# ---- live.json read + per-tier rising-edge detection --------------------- #
+def _default_live_json_path() -> str:
+    """Default meter location: ~/tbh-meter/live.json.
 
-    `pending` is an int >= 0 (chests waiting to be opened), or None on
-    read failure (game not running, attach still in progress, transient
-    error, wrong build). `mtime` is time.time() at the read — used by
-    the main loop for log timestamps and to skip logging on no-change
-    ticks.
+    On Windows, ~ is the user's home. We expand to an absolute path so
+    subprocess logs / error messages don't depend on the caller's cwd.
     """
+    return str(Path.home() / "tbh-meter" / "live.json")
+
+
+def read_state(live_json_path: str, prev_state):
+    """Read the live.json drops + run fields. mtime fast-poll: stat() first,
+    re-parse JSON only when mtime advances. No deps beyond stdlib.
+
+    Returns ((drops_tuple, run_id, mtime), True) on success,
+            (prev_state, False) on no-change / unreadable / parse-error.
+
+    drops_tuple is (Monster, Boss, ActBoss) — index = EMonsterLogType.
+    run_id is the meter's `run` field (advances at each new stage attempt);
+    mtime is the file's st_mtime at the read (used by tick() for log
+    timestamps and to skip logging on no-change ticks).
+    """
+    prev_drops, prev_run, prev_mtime = (None, None, 0.0) if prev_state is None else prev_state
     try:
-        n = memory_attach.get_pending(hwnd)
-    except Exception:
-        return None, time.time()
-    if n is None:
-        return None, time.time()
-    return int(n), time.time()
+        mtime = os.stat(live_json_path).st_mtime
+    except OSError:
+        return prev_state, False
+    if prev_mtime != 0.0 and mtime == prev_mtime:
+        return prev_state, False                                # file unchanged
+    try:
+        with open(live_json_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return prev_state, False
+    drops = d.get("drops")
+    if not isinstance(drops, list) or len(drops) != 3:
+        return prev_state, False                                # wrong shape
+    try:
+        drops_t = (int(drops[0] or 0), int(drops[1] or 0), int(drops[2] or 0))
+    except (TypeError, ValueError):
+        return prev_state, False
+    run_id = d.get("run")
+    try:
+        run_id = int(run_id) if run_id is not None else None
+    except (TypeError, ValueError):
+        run_id = None
+    return (drops_t, run_id, mtime), True
 
 
-def tick(hwnd, wx, wy, click_mode, prev_pending, log_fh, virtual_desktop=True):
-    """One poll. Returns the new `prev_pending` for the next tick.
+def _log(msg, log_fh):
+    print(msg)
+    log_fh.write(msg + "\n")
+    log_fh.flush()
 
-    State machine: `pending` is BoxObtain - BoxOpen (cumulative chests
-    dropped minus cumulative chests opened = chests waiting to be opened).
 
-      pending > prev_pending  → a chest dropped this tick → click once
-      pending < prev_pending  → a chest was opened (click confirmed) → log only
-      pending == prev_pending → no state change → skip work
+def tick(hwnd, wx, wy, click_mode, prev_state, log_fh, virtual_desktop, live_json_path):
+    """One poll. Returns the new `prev_state` for the next tick.
 
-    The counter is monotonic-up on BoxObtain events and monotonic-up on
-    BoxOpen events, so the difference `pending` is non-decreasing between
-    drops, decreases by exactly 1 per click-confirmed open, and never
-    resets within a profile (the only way it could go down outside a
-    click is if the user opens a chest manually, which is logged too).
+    State machine (per `mad-labs-org/tbh-meter/reader/meter_windows.py`):
+      drops = [Monster, Boss, ActBoss] per-run counter for the current run
+              plus any "absorbed" trailing-boss chests from the
+              pending-close phase.
+      drops[i] NEVER decrements on click — only resets to 0 at run end
+              (the meter "flushes the pending close"). So:
+      - cur[i] > prev[i]  → 1+ chests of tier i just dropped → click once
+      - cur[i] < prev[i]  → run-end reset (drops flushed to lower value)
+      - run id advanced    → run-end reset
+      - cur == prev        → no change, skip work
+
+      Auto-collected chests still get clicked: the meter counts *drops*,
+      not opens, so even if the chest auto-collects before our click, the
+      rising edge fired and we click once.
+
+      Multi-tier rise within the same tick: click ONCE per rising tier,
+      not once total. If drops goes [1,0,0]→[2,1,1] we click 3 times.
+      (The meter's per-tick "absorbed trailing-boss" mechanism can raise
+       2 tiers simultaneously.)
     """
-    cur, mtime = read_pending(hwnd)
+    state, changed = read_state(live_json_path, prev_state)
+    cur_drops, cur_run, cur_mtime = state
 
-    if cur is None:
-        # Transient read failure — keep prev_pending, log once per failure
-        # burst would be nice but a simple line per failed tick is fine
-        # (the human operator can see the cadence from the log).
-        msg = "[state] memory read failed (game not running? or attach still in progress?)"
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-        return prev_pending
-
-    # First ever read — establish baseline. No click even if pending > 0:
-    # by the time we read, the chest may already be openable; clicking
-    # blindly is wasted motion. Subsequent reads will catch the change.
-    if prev_pending is None:
-        msg = f"[state] baseline pending={cur} (BoxObtain - BoxOpen from game memory)"
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-        return cur
-
-    # No change — skip
-    if cur == prev_pending:
-        return cur
+    if not changed:
+        return prev_state                                       # no work
 
     # Compute click coord from current window position
     try:
         L, T, _, _ = window_rect(hwnd)
         ax, ay = L + wx, T + wy
     except RuntimeError as e:
-        err = f"[click] cannot get window rect: {e}"
-        print(err); log_fh.write(err + "\n"); log_fh.flush()
-        return cur
+        _log(f"[click] cannot get window rect: {e}", log_fh)
+        return state
 
-    if cur > prev_pending:
-        # Chest(s) dropped while the bot was running. Click once per new
-        # chest. The pending count IS the truth from the game; if it
-        # rose by N, N chests are waiting, click N times. No cooldown
-        # needed: pending is exact, not an estimated "is there one on
-        # screen" bit.
-        n_new = cur - prev_pending
-        msg = (f"[state] +{n_new} chest(s) dropped "
-               f"(pending {prev_pending} -> {cur}) | click ({ax},{ay})")
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
-        if click_mode == "dry-run":
-            pass
-        elif click_mode == "preview":
-            u32.SetCursorPos(ax, ay)
-            msg2 = f"[preview] cursor moved to ({ax},{ay}) -- verify, then add --click"
-            print(msg2); log_fh.write(msg2 + "\n"); log_fh.flush()
-        elif click_mode == "click":
+    prev_drops, prev_run, prev_mtime = (None, None, 0.0) if prev_state is None else prev_state
+
+    # First-ever read or new file -- establish baseline. No click even if
+    # drops > 0: by the time we read, the chests may already be openable;
+    # clicking blindly is wasted motion. Subsequent reads will catch the
+    # change.
+    if prev_drops is None:
+        _log(f"[state] baseline drops={list(cur_drops)} run={cur_run} (from {live_json_path})", log_fh)
+        return state
+
+    # Run-end reset: drops flushed to all zeros, or run id advanced.
+    # Either case = adopt fresh baseline, no clicks (we don't retroactively
+    # click chests that dropped in a previous run).
+    run_changed = cur_run is not None and prev_run is not None and cur_run != prev_run
+    zero_after_nonzero = all(c == 0 for c in cur_drops) and any(p > 0 for p in prev_drops)
+    if run_changed or zero_after_nonzero:
+        reason = "run id changed" if run_changed else "drops flushed to [0,0,0]"
+        _log(f"[state] run boundary ({reason}); prev={list(prev_drops)} run={prev_run}"
+             f" -> cur={list(cur_drops)} run={cur_run}; fresh baseline, no click", log_fh)
+        return state
+
+    # No change — skip (cur == prev means all tiers unchanged)
+    if cur_drops == prev_drops:
+        return state
+
+    # Per-tier rising edges: any cur[i] > prev[i] is a fresh drop → click.
+    n_clicks = 0
+    tier_names = ("Monster", "Boss", "ActBoss")
+    fired = []
+    for i in range(3):
+        if cur_drops[i] > prev_drops[i]:
+            n_clicks += cur_drops[i] - prev_drops[i]
+            fired.append("%s+%d" % (tier_names[i], cur_drops[i] - prev_drops[i]))
+
+    if n_clicks == 0:
+        # Some weird decrease we didn't classify as run-end (shouldn't happen
+        # in practice). Just adopt the new baseline.
+        _log(f"[state] non-monotonic drop: prev={list(prev_drops)} -> cur={list(cur_drops)}; "
+             f"adopting as new baseline (no click)", log_fh)
+        return state
+
+    _log(f"[state] +{n_clicks} chest(s) dropped "
+         f"(drops {list(prev_drops)} -> {list(cur_drops)}, tiers=[{', '.join(fired)}]) "
+         f"| click ({ax},{ay}) x{n_clicks}", log_fh)
+
+    if click_mode == "dry-run":
+        pass
+    elif click_mode == "preview":
+        u32.SetCursorPos(ax, ay)
+        _log(f"[preview] cursor moved to ({ax},{ay}) -- verify, then add --click", log_fh)
+    elif click_mode == "click":
+        for k in range(n_clicks):
             try:
                 click_abs(ax, ay, virtual_desktop=virtual_desktop)
             except RuntimeError as e:
-                err = f"[click] failed: {e}"
-                print(err); log_fh.write(err + "\n"); log_fh.flush()
-    else:
-        # pending fell — chest was opened (by our click, or manually by
-        # the user). The previous click is confirmed; no action needed.
-        n_opened = prev_pending - cur
-        msg = (f"[state] -{n_opened} chest(s) opened "
-               f"(pending {prev_pending} -> {cur}) | click confirmed")
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+                _log(f"[click] failed (click {k+1}/{n_clicks}): {e}", log_fh)
+                # Don't loop forever on a broken SendInput — return current state
+                return state
+            # Tiny gap between consecutive clicks to avoid the OS debouncing them
+            if k + 1 < n_clicks:
+                time.sleep(0.08 + random.random() * 0.05)
 
-    return cur
+    return state
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Memory-driven TBH chest opener. Clicks when BoxObtain-BoxOpen rises.")
+        description="Open TBH chest drops gated by meter live.json rising edges.")
     ap.add_argument("--wx", type=int, default=533,
                     help="Window-relative X of the chest icon (default 533)")
     ap.add_argument("--wy", type=int, default=744,
                     help="Window-relative Y of the chest icon (default 744)")
-    ap.add_argument("--poll", type=float, default=0.5,
-                    help="Seconds between memory reads (default 0.5). "
-                         "First call takes a few seconds while the reader "
-                         "attaches to the process; subsequent reads are <10 ms.")
+    ap.add_argument("--poll", type=float, default=0.25,
+                    help="Seconds between file stat() polls (default 0.25). "
+                         "Meter writes live.json ~1x/s; 0.25 gives sub-second "
+                         "reaction. Going faster is wasteful; going slower "
+                         "misses intermediate drops.")
+    ap.add_argument("--live-json", default=_default_live_json_path(),
+                    help="Path to the meter's live.json (default: %(default)s)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Log decisions but do not click")
     ap.add_argument("--preview", action="store_true",
@@ -352,7 +421,7 @@ def main():
     if not hwnd:
         msg = (f"[boot] TBH window not found ({_UNITY_CLASS} + {_EXPECTED_EXE}). "
                f"Is the game running and visible?")
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+        _log(msg, log_fh)
         return 1
 
     # Pre-validate click coord lands on a real monitor.
@@ -360,8 +429,7 @@ def main():
         L0, T0, _, _ = window_rect(hwnd)
         ax0, ay0 = validate_click_coord(hwnd, args.wx, args.wy)
     except RuntimeError as e:
-        msg = f"[boot] {e}"
-        print(msg); log_fh.write(msg + "\n"); log_fh.flush()
+        _log(f"[boot] {e}", log_fh)
         return 1
 
     # Click mode precedence: --click > --preview > default (dry-run).
@@ -377,37 +445,32 @@ def main():
     monitor_count = len(monitor_bounds())
     _VIRTUAL_DESKTOP = (monitor_count > 1)
 
+    # Verify the live.json path exists BEFORE we start the loop. A wrong
+    # path is a 1-second fix; debugging it from per-tick log lines is
+    # 5 minutes.
+    if not os.path.exists(args.live_json):
+        msg = (f"[boot] live.json not found at {args.live_json}. "
+               f"Is tbh-meter running? Use --live-json to override the path.")
+        _log(msg, log_fh)
+        return 1
+
     boot = (f"[boot] TBH hwnd={hwnd} rect=({L0},{T0},...) "
             f"click_rel=({args.wx},{args.wy}) abs=({ax0},{ay0}) "
             f"poll={args.poll}s mode={click_mode} monitors={monitor_count} "
             f"virtual_desktop={_VIRTUAL_DESKTOP} "
-            f"reader=memory(BoxObtain-BoxOpen); first read attaches the process (a few seconds)...")
-    print(boot); log_fh.write(boot + "\n"); log_fh.flush()
+            f"reader=live_json(drops[]); source={args.live_json}")
+    _log(boot, log_fh)
 
-    # Kick the memory reader on boot so the slow attach happens NOW
-    # (background) instead of blocking the first tick. get_pending()
-    # returns None silently until attach completes.
-    try:
-        _first = memory_attach.get_pending(hwnd)
-        if _first is not None:
-            attach_msg = f"[boot] memory reader attached; initial pending={_first}"
-        else:
-            attach_msg = "[boot] memory reader still attaching (will retry on first tick)"
-        print(attach_msg); log_fh.write(attach_msg + "\n"); log_fh.flush()
-    except Exception as e:
-        warn = f"[boot] memory reader warm-up failed: {e} (continuing; will retry on tick)"
-        print(warn); log_fh.write(warn + "\n"); log_fh.flush()
-
-    prev_pending = None
+    prev_state = None
     try:
         while True:
-            prev_pending = tick(hwnd, args.wx, args.wy, click_mode,
-                                prev_pending, log_fh,
-                                virtual_desktop=_VIRTUAL_DESKTOP)
+            prev_state = tick(hwnd, args.wx, args.wy, click_mode,
+                              prev_state, log_fh,
+                              virtual_desktop=_VIRTUAL_DESKTOP,
+                              live_json_path=args.live_json)
             time.sleep(args.poll)
     except KeyboardInterrupt:
         print("\n[chest-state] stopped")
-        memory_attach.shutdown()
         log_fh.close()
         return 0
 
