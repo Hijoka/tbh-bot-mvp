@@ -76,7 +76,7 @@ POLL_INTERVAL_S = 0.5     # how often to scan for new raw file
 POST_CLICK_SLEEP_S = 0.6  # pause after each click for UI to settle
 AUTOFILL_TIMEOUT_S = 5.0  # wait up to this long for confirm button to flip gray→blue
 CONFIRM_POLL_S     = 0.1  # pixel poll interval while waiting for autofill
-SYNTH_COOLDOWN_S   = 2.0  # after confirm, wait before next autofill (synthesis animation)
+SYNTH_COOLDOWN_S   = 5.0  # after confirm, wait before next autofill (synthesis animation; 5s = safe even on long synths)
 PANEL_OPEN_VERIFY_S = 1.0 # after panel-open click, pause before first action
 
 # ---------------------------------------------------------------------------
