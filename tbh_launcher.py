@@ -1,0 +1,392 @@
+"""tbh_launcher.py — single tray-icon entry point for tbh-bot-mvp.
+
+Wraps chest_state.py, cube_state.py, and orchestrator.py behind a system-tray
+icon and menu, matching the launch UX of preschian/tbh-presence (one icon,
+menu to arm modes, no console window).
+
+LAUNCH SHAPE
+------------
+- Auto-discover the game: $env:TBH_GAME_DIR first, then Steam default
+  ("C:\\Program Files (x86)\\Steam\\steamapps\\common\\TaskbarHero").
+  If neither exists, prompt once via tkinter and persist to config.
+- Tray icon (pystray) with menu:
+    [ ] Chest    — toggles `python chest_state.py --click`
+    [ ] Cube     — toggles `python cube_state.py  --click`
+    [ ] Orch     — toggles `python orchestrator.py --click`
+    Settings…   — re-runs the game-path prompt
+    Open log     — opens the log file in the default viewer
+    Quit
+- Each mode runs in its own subprocess thread. Disarming kills the child.
+- All child stdout/stderr are tee'd to logs/tbh_launcher.log.
+- Tray tooltip shows the latest line from any child, refreshed every 2 s.
+
+OPPORTUNISTIC, NEVER INTRUSIVE (Bob's rule #2)
+----------------------------------------------
+Every mode starts DISABLED. Nothing runs until you click its menu item.
+Disarming kills the child immediately. No wall-clock firing, no auto-start.
+
+USAGE (PowerShell, double-clickable via launch.bat):
+    python tbh_launcher.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import simpledialog
+from typing import Optional
+
+# pystray + PIL are the only non-stdlib deps. They install trivially on Windows:
+#     pip install pystray pillow
+try:
+    import pystray
+    from pystray import MenuItem as Item
+    from PIL import Image, ImageDraw
+except ImportError:
+    sys.stderr.write(
+        "tbh_launcher.py needs pystray + pillow. Install with:\n"
+        "    pip install pystray pillow\n"
+    )
+    raise
+
+# ---------------------------------------------------------------------------
+# Paths and config
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = REPO_ROOT / "tbh_launcher.json"
+LOG_DIR = REPO_ROOT / "logs"
+LOG_PATH = LOG_DIR / "tbh_launcher.log"
+
+STEAM_DEFAULT = r"C:\Program Files (x86)\Steam\steamapps\common\TaskbarHero"
+GAME_EXE = "TaskBarHero.exe"
+
+PYTHON_EXE = sys.executable  # use the same interpreter that launched us
+
+# Mode definitions: (label, script, default_args, env key for the path)
+MODES = [
+    ("Chest", "chest_state.py", ["--click"]),
+    ("Cube", "cube_state.py", ["--click"]),
+    ("Orch", "orchestrator.py", ["--click"]),
+]
+
+
+# ---------------------------------------------------------------------------
+# Config persistence
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def game_dir_valid(path: str) -> bool:
+    if not path:
+        return False
+    p = Path(path)
+    return p.exists() and (p / GAME_EXE).exists()
+
+
+def discover_game_dir() -> Optional[str]:
+    """env var → Steam default → None (caller will prompt)."""
+    env = os.environ.get("TBH_GAME_DIR")
+    if env and game_dir_valid(env):
+        return env
+    if game_dir_valid(STEAM_DEFAULT):
+        return STEAM_DEFAULT
+    return None
+
+
+def prompt_for_game_dir() -> Optional[str]:
+    """One-time modal prompt. Returns the path string or None on cancel."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        answer = simpledialog.askstring(
+            "TBH Launcher — game folder",
+            "Couldn't find TaskBarHero.exe.\n\n"
+            "Enter the full path to your TaskbarHero install folder\n"
+            "(the one containing TaskBarHero.exe).\n\n"
+            f"Default Steam location:\n{STEAM_DEFAULT}",
+            initialvalue=STEAM_DEFAULT,
+        )
+        if answer and game_dir_valid(answer):
+            return answer
+        return None
+    finally:
+        root.destroy()
+
+
+def ensure_game_dir(cfg: dict, write) -> str:
+    """Resolve and persist the game dir; prompt if missing.
+
+    `write` is a callable that takes a single str (the Logger.write method).
+    """
+    gdir = cfg.get("game_dir") or discover_game_dir()
+    if not gdir:
+        write("game dir not found — prompting")
+        gdir = prompt_for_game_dir()
+    if not gdir:
+        write("FATAL: no valid game dir; quitting")
+        raise SystemExit("No valid TaskbarHero install path. Set TBH_GAME_DIR or rerun and enter it.")
+    if not game_dir_valid(gdir):
+        write(f"WARN: saved game_dir is stale: {gdir}")
+        gdir = prompt_for_game_dir()
+        if not gdir:
+            raise SystemExit("No valid TaskbarHero install path.")
+    cfg["game_dir"] = gdir
+    save_config(cfg)
+    write(f"game_dir = {gdir}")
+    return gdir
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+class Logger:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(path, "a", encoding="utf-8", buffering=1)
+        self._lock = threading.Lock()
+        self.last_line = "starting…"
+
+    def write(self, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        with self._lock:
+            self._fh.write(line + "\n")
+            self.last_line = msg
+
+    def close(self) -> None:
+        with self._lock:
+            self._fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Subprocess supervision
+# ---------------------------------------------------------------------------
+
+class ModeRunner:
+    """Owns one child subprocess. Arms/disarms via start()/stop()."""
+
+    def __init__(self, label: str, script: str, args: list[str], env_extras: dict, log: Logger):
+        self.label = label
+        self.script = script
+        self.args = args
+        self.env_extras = env_extras
+        self.log = log
+        self.proc: Optional[subprocess.Popen] = None
+        self._reader: Optional[threading.Thread] = None
+        self.enabled = False
+
+    def start(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            return  # already running
+        cmd = [PYTHON_EXE, "-u", str(REPO_ROOT / self.script), *self.args]
+        env = os.environ.copy()
+        env.update(self.env_extras)
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as e:
+            self.log.write(f"[{self.label}] failed to start: {e}")
+            return
+        self.enabled = True
+        self.log.write(f"[{self.label}] started pid={self.proc.pid} cmd={' '.join(cmd)}")
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
+
+    def stop(self) -> None:
+        if not self.proc:
+            return
+        self.log.write(f"[{self.label}] stopping")
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.log.write(f"[{self.label}] terminate timed out, killing")
+            self.proc.kill()
+        except Exception as e:
+            self.log.write(f"[{self.label}] stop error: {e}")
+        finally:
+            self.proc = None
+            self.enabled = False
+
+    def _drain(self) -> None:
+        assert self.proc and self.proc.stdout
+        for line in self.proc.stdout:
+            try:
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self.log.write(f"[{self.label}] {text}")
+            except Exception:
+                pass
+        rc = self.proc.wait() if self.proc else -1
+        self.log.write(f"[{self.label}] exited rc={rc}")
+        self.enabled = False
+        self.proc = None
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+
+# ---------------------------------------------------------------------------
+# Tray icon
+# ---------------------------------------------------------------------------
+
+def make_icon_image() -> Image.Image:
+    """Generate a tiny helmet-ish icon at runtime — no asset file needed."""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    # dark disc
+    d.ellipse((4, 4, 60, 60), fill=(40, 40, 50, 255), outline=(200, 200, 220, 255), width=2)
+    # visor slit
+    d.rectangle((14, 28, 50, 38), fill=(120, 180, 255, 255))
+    # rivet dots
+    d.ellipse((10, 10, 16, 16), fill=(220, 220, 230, 255))
+    d.ellipse((48, 10, 54, 16), fill=(220, 220, 230, 255))
+    return img
+
+
+class App:
+    def __init__(self):
+        self.log = Logger(LOG_PATH)
+        self.cfg = load_config()
+        self.gdir = ensure_game_dir(self.cfg, self.log.write)
+        env_extras = {"TBH_GAME_DIR": self.gdir}
+        self.runners = {
+            label: ModeRunner(label, script, args, env_extras, self.log)
+            for (label, script, args) in MODES
+        }
+        self.icon: Optional[pystray.Icon] = None
+
+    # ---- menu actions ----------------------------------------------------
+    def toggle(self, label: str, icon, item) -> None:
+        r = self.runners[label]
+        if r.enabled:
+            r.stop()
+        else:
+            r.start()
+        self._refresh_tooltip()
+
+    def is_checked(self, label: str, item) -> bool:
+        return self.runners[label].enabled
+
+    def open_settings(self, icon, item) -> None:
+        new = prompt_for_game_dir()
+        if new:
+            self.cfg["game_dir"] = new
+            save_config(self.cfg)
+            self.gdir = new
+            for r in self.runners.values():
+                r.env_extras["TBH_GAME_DIR"] = new
+            self.log.write(f"game_dir updated to {new}")
+            self._refresh_tooltip()
+
+    def open_log(self, icon, item) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(LOG_PATH))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(LOG_PATH)])
+        except Exception as e:
+            self.log.write(f"could not open log: {e}")
+
+    def quit(self, icon, item) -> None:
+        self.log.write("quit requested")
+        for r in self.runners.values():
+            r.stop()
+        if self.icon:
+            self.icon.stop()
+        self.log.close()
+
+    # ---- tooltip / supervision -------------------------------------------
+    def _tooltip_text(self) -> str:
+        parts = [f"TBH Launcher — {self.gdir}"]
+        for label, r in self.runners.items():
+            mark = "●" if r.alive() else "○"
+            parts.append(f"{mark} {label}")
+        parts.append("—")
+        parts.append(self.log.last_line[:80])
+        return "\n".join(parts)
+
+    def _refresh_tooltip(self) -> None:
+        if self.icon:
+            try:
+                self.icon.title = self._tooltip_text()
+            except Exception:
+                pass
+
+    def _supervise(self) -> None:
+        # Periodically update tooltip and notice crashed children.
+        while True:
+            for r in self.runners.values():
+                if r.enabled and not r.alive():
+                    self.log.write(f"[{r.label}] child died unexpectedly")
+                    r.enabled = False
+            self._refresh_tooltip()
+            time.sleep(2)
+
+    def run(self) -> None:
+        menu = pystray.Menu(
+            Item("Chest", lambda i, it: self.toggle("Chest", i, it),
+                 checked=lambda i, it: self.is_checked("Chest", it),
+                 radio=False),
+            Item("Cube", lambda i, it: self.toggle("Cube", i, it),
+                 checked=lambda i, it: self.is_checked("Cube", it),
+                 radio=False),
+            Item("Orch", lambda i, it: self.toggle("Orch", i, it),
+                 checked=lambda i, it: self.is_checked("Orch", it),
+                 radio=False),
+            pystray.Menu.SEPARATOR,
+            Item("Settings…", self.open_settings),
+            Item("Open log", self.open_log),
+            Item("Quit", self.quit),
+        )
+        self.icon = pystray.Icon(
+            "tbh_launcher",
+            make_icon_image(),
+            title=self._tooltip_text(),
+            menu=menu,
+        )
+        threading.Thread(target=self._supervise, daemon=True).start()
+        self.log.write("tray icon shown; all modes DISABLED — pick from menu to arm")
+        self.icon.run()
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    app = App()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        app.quit(None, None)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
