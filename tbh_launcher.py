@@ -31,38 +31,80 @@ USAGE (PowerShell, double-clickable via launch.bat):
 
 from __future__ import annotations
 
+# CRITICAL: launch.bat uses pythonw.exe (windowless). Any unhandled exception
+# at import time disappears silently. We must catch everything and write to
+# logs/tbh_launcher.log BEFORE doing heavy imports.
+
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
+import traceback
 from pathlib import Path
-from tkinter import simpledialog
 from typing import Optional
 
-# pystray + PIL are the only non-stdlib deps. They install trivially on Windows:
-#     pip install pystray pillow
+# ---------------------------------------------------------------------------
+# Bootstrap: write a log file first, then import heavy deps.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent
+LOG_DIR = REPO_ROOT / "logs"
+LOG_PATH = LOG_DIR / "tbh_launcher.log"
+CONFIG_PATH = REPO_ROOT / "tbh_launcher.json"
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def _bootstrap_log(msg: str) -> None:
+    """Write a line to the log even before Logger class exists."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8", buffering=1) as fh:
+            ts = time.strftime("%H:%M:%S")
+            fh.write(f"[{ts}] [bootstrap] {msg}\n")
+    except Exception:
+        pass  # if even this fails, there's nothing we can do
+
+_bootstrap_log(f"launcher starting, pid={os.getpid()}, python={sys.executable}")
+_bootstrap_log(f"sys.version={sys.version.split()[0]}, platform={sys.platform}")
+
+def _fatal(msg: str, exc: Optional[BaseException] = None) -> None:
+    _bootstrap_log(f"FATAL: {msg}")
+    if exc is not None:
+        _bootstrap_log("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    # Also try to write to stderr in case a console exists (running directly).
+    try:
+        sys.stderr.write(f"tbh_launcher: {msg}\n")
+        if exc is not None:
+            traceback.print_exc()
+    except Exception:
+        pass
+
 try:
-    import pystray
-    from pystray import MenuItem as Item
-    from PIL import Image, ImageDraw
-except ImportError:
-    sys.stderr.write(
-        "tbh_launcher.py needs pystray + pillow. Install with:\n"
-        "    pip install pystray pillow\n"
-    )
-    raise
+    import subprocess
+    from tkinter import simpledialog  # lazy-imported inside prompt_for_game_dir
+    import tkinter as tk
+    _bootstrap_log("stdlib imports OK")
+except Exception as e:
+    _fatal("stdlib import failed", e)
+    sys.exit(1)
+
+# Lazy GUI imports — only required when actually showing the tray / dialog.
+def _import_gui():
+    global pystray, Item, Image, ImageDraw
+    try:
+        import pystray
+        from pystray import MenuItem as Item
+        from PIL import Image, ImageDraw
+        _bootstrap_log("pystray + pillow imported OK")
+        return True
+    except Exception as e:
+        _fatal("pystray/pillow import failed. Run: pip install pystray pillow", e)
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Paths and config
 # ---------------------------------------------------------------------------
-
-REPO_ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = REPO_ROOT / "tbh_launcher.json"
-LOG_DIR = REPO_ROOT / "logs"
-LOG_PATH = LOG_DIR / "tbh_launcher.log"
 
 STEAM_DEFAULT = r"C:\Program Files (x86)\Steam\steamapps\common\TaskbarHero"
 GAME_EXE = "TaskBarHero.exe"
@@ -255,15 +297,12 @@ class ModeRunner:
 # Tray icon
 # ---------------------------------------------------------------------------
 
-def make_icon_image() -> Image.Image:
+def make_icon_image():
     """Generate a tiny helmet-ish icon at runtime — no asset file needed."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    # dark disc
     d.ellipse((4, 4, 60, 60), fill=(40, 40, 50, 255), outline=(200, 200, 220, 255), width=2)
-    # visor slit
     d.rectangle((14, 28, 50, 38), fill=(120, 180, 255, 255))
-    # rivet dots
     d.ellipse((10, 10, 16, 16), fill=(220, 220, 230, 255))
     d.ellipse((48, 10, 54, 16), fill=(220, 220, 230, 255))
     return img
@@ -279,7 +318,7 @@ class App:
             label: ModeRunner(label, script, args, env_extras, self.log)
             for (label, script, args) in MODES
         }
-        self.icon: Optional[pystray.Icon] = None
+        self.icon = None  # type: ignore[assignment]
 
     # ---- menu actions ----------------------------------------------------
     def toggle(self, label: str, icon, item) -> None:
@@ -380,11 +419,21 @@ class App:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    app = App()
+    if not _import_gui():
+        return 2  # log already has the diagnosis
+    app = None
     try:
+        app = App()
         app.run()
     except KeyboardInterrupt:
-        app.quit(None, None)
+        if app is not None:
+            try:
+                app.quit(None, None)
+            except Exception:
+                pass
+    except Exception as e:
+        _fatal("unhandled exception in App.run", e)
+        return 1
     return 0
 
 
