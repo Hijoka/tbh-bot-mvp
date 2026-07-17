@@ -321,7 +321,16 @@ class App:
         self.icon = None  # type: ignore[assignment]
 
     # ---- menu actions ----------------------------------------------------
-    def toggle(self, label: str, icon, item) -> None:
+    # pystray invokes callbacks with ONE arg (the MenuItem). Methods that take
+    # `item` match that contract. _actions is used as a stable handle for the
+    # pystray.Item constructors below.
+    def _toggle_chest(self, item): self._toggle("Chest")
+    def _toggle_cube(self, item): self._toggle("Cube")
+    def _toggle_orch(self, item): self._toggle("Orch")
+    def _is_checked(self, label: str) -> bool:
+        return self.runners[label].enabled
+
+    def _toggle(self, label: str) -> None:
         r = self.runners[label]
         if r.enabled:
             r.stop()
@@ -329,10 +338,7 @@ class App:
             r.start()
         self._refresh_tooltip()
 
-    def is_checked(self, label: str, item) -> bool:
-        return self.runners[label].enabled
-
-    def open_settings(self, icon, item) -> None:
+    def open_settings(self, item) -> None:
         new = prompt_for_game_dir()
         if new:
             self.cfg["game_dir"] = new
@@ -343,7 +349,7 @@ class App:
             self.log.write(f"game_dir updated to {new}")
             self._refresh_tooltip()
 
-    def open_log(self, icon, item) -> None:
+    def open_log(self, item) -> None:
         try:
             if sys.platform == "win32":
                 os.startfile(str(LOG_PATH))  # type: ignore[attr-defined]
@@ -352,7 +358,7 @@ class App:
         except Exception as e:
             self.log.write(f"could not open log: {e}")
 
-    def quit(self, icon, item) -> None:
+    def quit(self, item) -> None:
         self.log.write("quit requested")
         for r in self.runners.values():
             r.stop()
@@ -361,14 +367,17 @@ class App:
         self.log.close()
 
     # ---- tooltip / supervision -------------------------------------------
+    # Windows NOTIFYICONDATAW.szTip is capped at 128 chars. Keep the tooltip
+    # short — show modes, drop the long game path, show a short status line.
     def _tooltip_text(self) -> str:
-        parts = [f"TBH Launcher — {self.gdir}"]
-        for label, r in self.runners.items():
-            mark = "●" if r.alive() else "○"
-            parts.append(f"{mark} {label}")
-        parts.append("—")
-        parts.append(self.log.last_line[:80])
-        return "\n".join(parts)
+        marks = " ".join(
+            f"{'●' if r.alive() else '○'}{label[0]}"
+            for label, r in self.runners.items()
+        )
+        status = self.log.last_line[:40]
+        # Build the line, then truncate to fit.
+        line = f"TBH {marks} — {status}"
+        return line[:127]
 
     def _refresh_tooltip(self) -> None:
         if self.icon:
@@ -389,14 +398,14 @@ class App:
 
     def run(self) -> None:
         menu = pystray.Menu(
-            Item("Chest", lambda i, it: self.toggle("Chest", i, it),
-                 checked=lambda i, it: self.is_checked("Chest", it),
+            Item("Chest", self._toggle_chest,
+                 checked=lambda item: self._is_checked("Chest"),
                  radio=False),
-            Item("Cube", lambda i, it: self.toggle("Cube", i, it),
-                 checked=lambda i, it: self.is_checked("Cube", it),
+            Item("Cube", self._toggle_cube,
+                 checked=lambda item: self._is_checked("Cube"),
                  radio=False),
-            Item("Orch", lambda i, it: self.toggle("Orch", i, it),
-                 checked=lambda i, it: self.is_checked("Orch", it),
+            Item("Orch", self._toggle_orch,
+                 checked=lambda item: self._is_checked("Orch"),
                  radio=False),
             pystray.Menu.SEPARATOR,
             Item("Settings…", self.open_settings),
@@ -428,7 +437,7 @@ def main() -> int:
     except KeyboardInterrupt:
         if app is not None:
             try:
-                app.quit(None, None)
+                app.quit(None)
             except Exception:
                 pass
     except Exception as e:
