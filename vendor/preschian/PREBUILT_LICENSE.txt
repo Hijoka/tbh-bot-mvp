@@ -1,0 +1,58 @@
+Prebuilt DLL attribution
+========================
+
+File: prebuilt\TbhAutoSynth-next.dll
+Source: https://github.com/preschian/tbh-presence
+Original path in source repo: autosynth/prebuilt/TbhAutoSynth-next.dll
+Plugin author: preschian (TbhPresence/TBH Auto Synthesis)
+Plugin version (per source): 0.24.0 [next/resilient]
+Build type: Patch-resistant (built with /define:RESILIENT, which resolves
+obfuscated members by signature at runtime so game patches no longer require
+a manual remap).
+
+We DO NOT commit this DLL to this repository. You obtain it directly from
+preschian's releases: https://github.com/preschian/tbh-presence/releases
+
+License
+-------
+The plugin source is published by preschian under the terms stated at
+https://github.com/preschian/tbh-presence . We do not redistribute the
+binary; we link to it. This file exists to (a) document where the binary
+came from, (b) make the dependency explicit so any auditor can find the
+original source for inspection, and (c) avoid any ambiguity about which
+version of the plugin our orchestrator is designed to interface with.
+
+Configuration we expect to be set by cube_launcher.ps1
+------------------------------------------------------
+[Timing]
+AfterFillSeconds = 1.0
+AfterSynthesisSeconds = 4.0
+CycleIntervalSeconds = 300
+
+[General]
+AutoStart = false
+AutoOpenCube = false
+SynthesisTypes = Equipment,Materials,Accessories
+
+[Safety]
+MaxGrade = 2
+
+Plugin status JSON we observe (read-only, never written by us)
+--------------------------------------------------------------
+Path: %LOCALAPPDATA%\tbh-companion\autosynth-status.json
+Format (truncated, from Plugin.cs):
+  {"version":"0.24.0","auto":<bool>,"phase":"<Fill|Synth|Clear>",
+   "cycles":<int>,"lastCount":<int>,"lastGrade":<int>,
+   "maxGrade":<int>,"cycleIntervalSeconds":<int>,"updatedUtc":"<ISO-8601>"}
+
+What we do with it
+------------------
+Our orchestrator.py reads this JSON via mtime fast-poll (read-only) and
+prints changes to orchestrator.log. We do not write to it. We do not
+toggle keys, click anything, or invoke the plugin. The user owns F8.
+
+References
+----------
+- preschian/tbh-presence repo: https://github.com/preschian/tbh-presence
+- Plugin source file: https://github.com/preschian/tbh-presence/blob/main/autosynth/Plugin.cs
+- Offset table (game v1.00.27): https://github.com/preschian/tbh-presence/blob/main/CONTRIBUTING.md
